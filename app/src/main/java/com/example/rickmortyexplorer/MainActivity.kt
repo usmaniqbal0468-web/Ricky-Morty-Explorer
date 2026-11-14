@@ -28,6 +28,12 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.google.firebase.database.DataSnapshot          // NEW
+import com.google.firebase.database.DatabaseError          // NEW
+import com.google.firebase.database.DatabaseReference      // NEW
+import com.google.firebase.database.FirebaseDatabase       // NEW
+import com.google.firebase.database.ServerValue            // NEW
+import com.google.firebase.database.ValueEventListener     // NEW
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -42,7 +48,6 @@ import retrofit2.http.GET
 import retrofit2.http.Query
 import java.io.IOException
 
-// ───────────────────────── MODELS ─────────────────────────
 
 @Serializable
 data class Info(val count: Int, val pages: Int)
@@ -77,7 +82,6 @@ data class LocationDto(
     val residents: List<String>
 )
 
-/** One generic model the UI can display, whatever the category is. */
 data class DisplayItem(
     val name: String,
     val imageUrl: String?,
@@ -87,7 +91,34 @@ data class DisplayItem(
     val value2: String
 )
 
-// Episodes and locations have no image, so borrow a character's avatar
+data class SavedItem(
+    val name: String,
+    val imageUrl: String,
+    val label1: String,
+    val value1: String,
+    val label2: String,
+    val value2: String,
+    val category: String,
+    val timestamp: Long
+)
+
+private fun DataSnapshot.toSavedItem(): SavedItem? {
+    val name = child("name").getValue(String::class.java) ?: return null
+    return SavedItem(
+        name = name,
+        imageUrl = child("imageUrl").getValue(String::class.java) ?: "",
+        label1 = child("label1").getValue(String::class.java) ?: "",
+        value1 = child("value1").getValue(String::class.java) ?: "",
+        label2 = child("label2").getValue(String::class.java) ?: "",
+        value2 = child("value2").getValue(String::class.java) ?: "",
+        category = child("category").getValue(String::class.java) ?: "",
+        timestamp = child("timestamp").getValue(Long::class.java) ?: 0L
+    )
+}
+
+fun SavedItem.toDisplay() =
+    DisplayItem(name, imageUrl.ifBlank { null }, label1, value1, label2, value2)
+
 private fun avatarFromUrl(characterUrl: String?): String? =
     characterUrl?.substringAfterLast('/')?.toIntOrNull()
         ?.let { "https://rickandmortyapi.com/api/character/avatar/$it.jpeg" }
@@ -105,12 +136,11 @@ fun LocationDto.toDisplay() =
         "Dimension", dimension.ifBlank { "unknown" }
     )
 
-// ───────────────────────── NETWORK ─────────────────────────
+
 
 private const val BASE_URL = "https://rickandmortyapi.com/api/"
 
 interface RickAndMortyApi {
-    // A null "name" is omitted from the URL by Retrofit
     @GET("character")
     suspend fun getCharacters(@Query("name") name: String?): ApiResponse<CharacterDto>
 
@@ -133,7 +163,13 @@ object RickAndMortyService {
     }
 }
 
-// ───────────────────────── VIEWMODEL ─────────────────────────
+
+private const val DB_URL = "https://rickmortyexplorer-4eccc-default-rtdb.europe-west1.firebasedatabase.app/"
+
+private fun dbRoot(): DatabaseReference =
+    if (DB_URL.contains("YOUR-PROJECT")) FirebaseDatabase.getInstance().reference
+    else FirebaseDatabase.getInstance(DB_URL).reference
+
 
 enum class Category(val label: String) {
     CHARACTER("Character"), EPISODE("Episode"), LOCATION("Location")
@@ -155,11 +191,51 @@ class ExplorerViewModel : ViewModel() {
     var uiState: ExplorerUiState by mutableStateOf(ExplorerUiState.Loading)
         private set
 
+    var rollCount by mutableStateOf(0L)
+        private set
+    var history by mutableStateOf<List<SavedItem>>(emptyList())
+        private set
+    var message by mutableStateOf<String?>(null)
+        private set
+
     private var items: List<DisplayItem> = emptyList()
     private var total = 0
     private var searchJob: Job? = null
 
-    init { load() }   // random item every time the app opens
+    private val db: DatabaseReference = dbRoot()
+
+    private val rollListener = object : ValueEventListener {
+        override fun onDataChange(snapshot: DataSnapshot) {
+            rollCount = snapshot.getValue(Long::class.java) ?: 0L
+        }
+        override fun onCancelled(error: DatabaseError) {
+            message = "Database error: ${error.message}"
+        }
+    }
+
+    private val historyListener = object : ValueEventListener {
+        override fun onDataChange(snapshot: DataSnapshot) {
+            history = snapshot.children
+                .mapNotNull { it.toSavedItem() }
+                .sortedByDescending { it.timestamp }
+        }
+        override fun onCancelled(error: DatabaseError) {
+            message = "Database error: ${error.message}"
+        }
+    }
+
+    init {
+        load()
+        // NEW: live updates from Firebase
+        db.child("rollCount").addValueEventListener(rollListener)
+        db.child("history").addValueEventListener(historyListener)
+    }
+
+    override fun onCleared() {   // NEW
+        db.child("rollCount").removeEventListener(rollListener)
+        db.child("history").removeEventListener(historyListener)
+        super.onCleared()
+    }
 
     fun onCategoryChange(newCategory: Category) {
         if (newCategory == category) return
@@ -178,7 +254,41 @@ class ExplorerViewModel : ViewModel() {
         val pool = if (items.size > 1) items.filter { it != current } else items
         if (pool.isNotEmpty()) {
             uiState = ExplorerUiState.Success(total, items.size, pool.random())
+            db.child("rollCount").setValue(ServerValue.increment(1))
+                .addOnFailureListener { message = "Roll count failed: ${it.message}" }
         }
+    }
+
+    fun saveCurrent() {
+        val item = (uiState as? ExplorerUiState.Success)?.item ?: return
+        val data = mapOf(
+            "name" to item.name,
+            "imageUrl" to (item.imageUrl ?: ""),
+            "label1" to item.label1,
+            "value1" to item.value1,
+            "label2" to item.label2,
+            "value2" to item.value2,
+            "category" to category.label,
+            "timestamp" to ServerValue.TIMESTAMP
+        )
+        db.child("lastSaved").setValue(data)
+        db.child("history").push().setValue(data)
+            .addOnSuccessListener { message = "Saved \"${item.name}\"" }
+            .addOnFailureListener { message = "Save failed: ${it.message}" }
+    }
+
+    fun loadLast() {
+        db.child("lastSaved").get()
+            .addOnSuccessListener { snapshot ->
+                val saved = snapshot.toSavedItem()
+                if (saved == null) {
+                    message = "Nothing saved yet"
+                } else {
+                    uiState = ExplorerUiState.Success(total, items.size, saved.toDisplay())
+                    message = "Loaded \"${saved.name}\" (${saved.category})"
+                }
+            }
+            .addOnFailureListener { message = "Load failed: ${it.message}" }
     }
 
     fun retry() = load()
@@ -186,7 +296,7 @@ class ExplorerViewModel : ViewModel() {
     private fun load(debounce: Boolean = false) {
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
-            if (debounce) delay(400)   // wait until the user stops typing
+            if (debounce) delay(400)
             uiState = ExplorerUiState.Loading
             try {
                 val name = query.trim().ifBlank { null }
@@ -205,7 +315,6 @@ class ExplorerViewModel : ViewModel() {
                 uiState = if (items.isEmpty()) ExplorerUiState.Empty
                 else ExplorerUiState.Success(total, items.size, items.random())
             } catch (e: HttpException) {
-                // The API answers 404 when the filter matches nothing
                 items = emptyList()
                 uiState = if (e.code() == 404) ExplorerUiState.Empty
                 else ExplorerUiState.Error("Server error ${e.code()}")
@@ -218,13 +327,13 @@ class ExplorerViewModel : ViewModel() {
     }
 }
 
-// ───────────────────────── UI ─────────────────────────
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ExplorerScreen(vm: ExplorerViewModel = viewModel()) {
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Rick and Morty Explorer") }) }
+        topBar = { TopAppBar(title = { Text("Rick and Morty Explorer (Firebase)") }) }
     ) { padding ->
         Column(
             modifier = Modifier
@@ -275,7 +384,7 @@ fun ExplorerScreen(vm: ExplorerViewModel = viewModel()) {
                 }
 
                 is ExplorerUiState.Success -> {
-                    StatsCard(vm.category, state.total, state.retrieved)
+                    StatsCard(vm.category, state.total, state.retrieved, vm.rollCount)
                     ItemCard(state.item)
                 }
             }
@@ -289,18 +398,47 @@ fun ExplorerScreen(vm: ExplorerViewModel = viewModel()) {
                 Spacer(Modifier.width(8.dp))
                 Text("Roll Random Item")
             }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = vm::saveCurrent,
+                    enabled = vm.uiState is ExplorerUiState.Success,
+                    modifier = Modifier.weight(1f).height(48.dp)
+                ) { Text("Save Item") }
+
+                Button(
+                    onClick = vm::loadLast,
+                    modifier = Modifier.weight(1f).height(48.dp)
+                ) { Text("Load Last") }
+            }
+
+            vm.message?.let {
+                Text(it, style = MaterialTheme.typography.bodyMedium)
+            }
+
+            HorizontalDivider()
+            Text("History of saved items (${vm.history.size})", fontWeight = FontWeight.Bold)
+            if (vm.history.isEmpty()) {
+                Text("No saved items yet.")
+            } else {
+                vm.history.forEach { HistoryRow(it) }
+            }
         }
     }
 }
 
 @Composable
-private fun StatsCard(category: Category, total: Int, retrieved: Int) {
+private fun StatsCard(category: Category, total: Int, retrieved: Int, rollCount: Long) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
     ) {
         Column(Modifier.padding(12.dp)) {
-            Text("API Stats", fontWeight = FontWeight.Bold)
+            Text("Firebase & API Stats", fontWeight = FontWeight.Bold)
+            Text("Total Rolls (Synced): $rollCount", fontWeight = FontWeight.Bold)
             Text("Total ${category.label}s in API: $total")
             Text("Retrieved in current view: $retrieved items")
         }
@@ -350,7 +488,34 @@ private fun LabeledValue(label: String, value: String) {
     }
 }
 
-// ───────────────────────── ACTIVITY ─────────────────────────
+@Composable
+private fun HistoryRow(item: SavedItem) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(8.dp).fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            if (item.imageUrl.isNotBlank()) {
+                AsyncImage(
+                    model = item.imageUrl,
+                    contentDescription = item.name,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.size(56.dp).clip(RoundedCornerShape(8.dp))
+                )
+            }
+            Column {
+                Text(item.name, fontWeight = FontWeight.Bold)
+                Text(
+                    "${item.category} • ${item.label1}: ${item.value1} • ${item.label2}: ${item.value2}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+    }
+}
+
+
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {

@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "226056677612",
+    "project_id": "rickmortyexplorer-4eccc",
+    "storage_bucket": "rickmortyexplorer-4eccc.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:226056677612:android:98f0402f4beebfa6e69dc9",
+        "android_client_info": {
+          "package_name": "com.example.rickmortyexplorer"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBmxQM5s2FyiR-J84dJnGT-psApNdXDkSU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
